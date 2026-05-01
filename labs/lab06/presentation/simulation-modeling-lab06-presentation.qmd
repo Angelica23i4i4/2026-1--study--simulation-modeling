@@ -1,10 +1,8 @@
 ---
 ## Author
 author:
-  name: Дмитрий Сергеевич Кулябов
-  degrees: DSc
-  orcid: 0000-0002-0877-7063
-  email: kulyabov-ds@rudn.ru
+  name: Федорова Анжелика ИГоревна
+  email: 1132236011@rudn.ru
   affiliation:
     - name: Российский университет дружбы народов
       country: Российская Федерация
@@ -30,8 +28,7 @@ date-format: "YYYY-MM-DD" # Example: 2025-09-06
   * д.ф.-м.н., профессор
   * профессор кафедры теории вероятностей и кибербезопасности
   * Российский университет дружбы народов им. П. Лумумбы
-  * [kulyabov-ds@rudn.ru](mailto:kulyabov-ds@rudn.ru)
-  * <https://yamadharma.github.io/ru/>
+  * [1132236011@rudn.ru](mailto:1132236011@rudn.ru)
 
 :::
 ::: {.column width="30%"}
