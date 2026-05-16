@@ -1,0 +1,228 @@
+using DrWatson
+@quickactivate "project"
+
+using ResumableFunctions
+using ConcurrentSim
+using Distributions
+using StableRNGs
+using Statistics
+using CairoMakie
+using JLD2
+
+# ===== Параметры =====
+const RUNS          = 10
+const N             = 10
+const S             = 3
+const LAMBDA        = 100.0
+const MU            = 1.0
+const NUM_REPAIRMEN = 1
+const SEED          = 42
+
+# ===== Структура мониторинга =====
+mutable struct Monitor
+    times::Vector{Float64}
+    working::Vector{Int}
+    queue_len::Vector{Int}
+end
+Monitor() = Monitor(Float64[], Int[], Int[])
+
+# ===== Поведение машины =====
+@resumable function machine(
+    env::Environment,
+    repair_facility::Resource,
+    spares::Store{Process},
+    F::Distribution,
+    G::Distribution,
+    rng,
+    mon::Monitor,
+    total::Int,
+)
+    while true
+        try
+            @yield timeout(env, Inf)
+        catch
+        end
+
+        # работаем до поломки
+        @yield timeout(env, rand(rng, F))
+
+        # логируем момент поломки
+        push!(mon.times,     now(env))
+        push!(mon.queue_len, repair_facility.level)
+
+        # берём запасную
+        get_spare = take!(spares)
+        @yield get_spare | timeout(env)
+
+        if state(get_spare) != ConcurrentSim.idle
+            @yield interrupt(value(get_spare))
+        else
+            throw(StopSimulation("No more spares!"))
+        end
+
+        # ремонт
+        @yield request(repair_facility)
+        @yield timeout(env, rand(rng, G))
+        @yield unlock(repair_facility)
+
+        # возвращаемся в резерв
+        @yield put!(spares, active_process(env))
+    end
+end
+
+@resumable function start_sim(
+    env, repair_facility, spares, F, G, rng, mon, n, s, total
+)
+    for i in 1:n
+        proc = @process machine(env, repair_facility, spares, F, G, rng, mon, total)
+        @yield interrupt(proc)
+    end
+    for i in 1:s
+        proc = @process machine(env, repair_facility, spares, F, G, rng, mon, total)
+        @yield put!(spares, proc)
+    end
+end
+
+# ===== Одна симуляция =====
+function sim_repair(; n=N, s=S, lam=LAMBDA, mu=MU, num_repairmen=NUM_REPAIRMEN, seed=SEED)
+    rng   = StableRNG(seed)
+    F     = Exponential(lam)
+    G     = Exponential(mu)
+    mon   = Monitor()
+    total = n + s
+
+    sim             = Simulation()
+    repair_facility = Resource(sim, num_repairmen)
+    spares          = Store{Process}(sim)
+
+    @process start_sim(sim, repair_facility, spares, F, G, rng, mon, n, s, total)
+    run(sim)
+
+    # считаем число исправных машин в каждый момент
+    working = Int[]
+    cur = total
+    for _ in mon.times
+        cur -= 1
+        push!(working, cur)
+    end
+    mon.working = working
+
+    return now(sim), mon
+end
+
+# ===== Аналитика (марковская цепь) =====
+function analytical_mean_time(n, s, lam, mu)
+    total  = n + s
+    states = n:total
+    m      = length(states)
+    A      = zeros(m, m)
+    b      = ones(m)
+
+    for (idx, i) in enumerate(states)
+        working   = min(n, i)
+        in_repair = total - i
+        lam_rate  = working * (1.0 / lam)
+        mu_rate   = (in_repair > 0) ? (1.0 / mu) : 0.0
+        q_i       = lam_rate + mu_rate
+
+        A[idx, idx] = q_i
+        if i < total
+            A[idx, idx+1] -= mu_rate
+        end
+        if i > n
+            A[idx, idx-1] -= lam_rate
+        end
+    end
+
+    x = A \ b
+    return x[end]   # E[T] из состояния n+s
+end
+
+# ===== Прогоны =====
+println("Запуск симуляции...")
+
+crash_times = [sim_repair(seed=SEED+i)[1] for i in 1:RUNS]
+mean_sim    = mean(crash_times)
+mean_ana    = analytical_mean_time(N, S, LAMBDA, MU)
+
+println("Среднее время до краша (симуляция): $(round(mean_sim, digits=2)) ч.")
+println("Среднее время до краша (аналитика): $(round(mean_ana, digits=2)) ч.")
+
+# для графика деградации — один детальный прогон
+_, mon = sim_repair(seed=SEED)
+
+# E[T] для разного S
+s_range  = 1:8
+ana_S    = [analytical_mean_time(N, s, LAMBDA, MU) for s in s_range]
+sim_S    = [mean(sim_repair(s=s, seed=SEED+i)[1] for i in 1:RUNS) for s in s_range]
+
+# E[T] для разного числа ремонтников
+rep_range = 1:4
+sim_R     = [mean(sim_repair(num_repairmen=r, seed=SEED+i)[1] for i in 1:RUNS) for r in rep_range]
+
+# ===== Графики =====
+mkpath(plotsdir())
+
+# --- График 1: время до краша по прогонам ---
+fig1 = Figure(size=(800, 450))
+ax1  = Axis(fig1[1,1],
+    xlabel = "Номер прогона",
+    ylabel = "Время до краша (ч.)",
+    title  = "Модель Росса: время до краша (N=$N, S=$S)")
+barplot!(ax1, 1:RUNS, crash_times, color=:steelblue)
+hlines!(ax1, [mean_sim],  color=:red,    linewidth=2, label="Среднее (сим.)")
+hlines!(ax1, [mean_ana],  color=:orange, linewidth=2, linestyle=:dash, label="Аналитика")
+axislegend(ax1)
+save(plotsdir("ross_crash_times.png"), fig1)
+println("Сохранён: ross_crash_times.png")
+
+# --- График 2: деградация числа исправных машин ---
+fig2 = Figure(size=(900, 450))
+ax2  = Axis(fig2[1,1],
+    xlabel = "Время (ч.)",
+    ylabel = "Число исправных машин",
+    title  = "Модель Росса: деградация системы во времени")
+stairs!(ax2, mon.times, mon.working, color=:steelblue, linewidth=2, label="Исправных машин")
+hlines!(ax2, [N], color=:red,   linewidth=2, linestyle=:dash, label="Минимум N=$N (крах)")
+hlines!(ax2, [N+S], color=:green, linewidth=1, linestyle=:dot, label="Начало N+S=$(N+S)")
+axislegend(ax2)
+save(plotsdir("ross_degradation.png"), fig2)
+println("Сохранён: ross_degradation.png")
+
+# --- График 3: длина очереди на ремонт ---
+fig3 = Figure(size=(900, 450))
+ax3  = Axis(fig3[1,1],
+    xlabel = "Время (ч.)",
+    ylabel = "Длина очереди на ремонт",
+    title  = "Модель Росса: мониторинг очереди")
+stairs!(ax3, mon.times, mon.queue_len, color=:darkorange, linewidth=2)
+save(plotsdir("ross_queue.png"), fig3)
+println("Сохранён: ross_queue.png")
+
+# --- График 4: E[T] vs число запасных S ---
+fig4 = Figure(size=(800, 450))
+ax4  = Axis(fig4[1,1],
+    xlabel = "Число запасных машин S",
+    ylabel = "E[T] до краша (ч.)",
+    title  = "Модель Росса: влияние резерва")
+lines!(ax4,   collect(s_range), ana_S, color=:red,       linewidth=2, label="Аналитика")
+scatter!(ax4, collect(s_range), sim_S, color=:steelblue, markersize=10, label="Симуляция")
+axislegend(ax4)
+save(plotsdir("ross_vs_S.png"), fig4)
+println("Сохранён: ross_vs_S.png")
+
+# --- График 5: E[T] vs число ремонтников ---
+fig5 = Figure(size=(700, 450))
+ax5  = Axis(fig5[1,1],
+    xlabel = "Число ремонтников",
+    ylabel = "E[T] до краша (ч.)",
+    title  = "Модель Росса: влияние числа ремонтников")
+barplot!(ax5, collect(rep_range), sim_R, color=:mediumseagreen)
+save(plotsdir("ross_vs_repairmen.png"), fig5)
+println("Сохранён: ross_vs_repairmen.png")
+
+# ===== Сохранение данных =====
+wsave(datadir("sims", "ross_results.jld2"),
+    @strdict N S LAMBDA MU NUM_REPAIRMEN RUNS mean_sim mean_ana crash_times)
+println("\nДанные сохранены в data/sims/ross_results.jld2")
+println("\nГотово! Графики в папке plots/")
